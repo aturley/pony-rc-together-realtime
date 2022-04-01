@@ -1,0 +1,8 @@
+{
+  "locks": [
+    {
+      "locator": "github.com/ponylang/net_ssl.git",
+      "revision": "1.2.1"
+    }
+  ]
+}
