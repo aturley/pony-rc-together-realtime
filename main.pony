@@ -88,6 +88,20 @@ class val Message
     masking_key = masking_key'
     payload = payload'
 
+  fun payload_unmasked(): Array[U8] val =>
+    if mask then
+      let pl: Array[U8] trn = recover Array[U8](payload.size()) end
+
+      for (i, v) in payload.pairs() do
+        try
+          pl.push(v xor masking_key(i % 4)?)
+        end
+      end
+      consume pl
+    else
+      payload
+    end
+
   fun render(writer: Writer) =>
     writer.u8((if fin then U8(0x80) else U8(0) end) or opcode)
 
@@ -143,42 +157,49 @@ primitive MessageDecoder
       var pos: USize = 0
       
       let f_and_opcode = rb.peek_u8(pos)?
-      let fin = (f_and_opcode and 0x80) > 0
+      let fin = (f_and_opcode and 0x80) != 0
       let opcode = f_and_opcode and 0x0F
       pos = pos + 1
 
       // | mask | payload len (7) |
       let mask_and_payload_len = rb.peek_u8(pos)?
-      let mask = (mask_and_payload_len and 0x80) > 0
+      let mask = (mask_and_payload_len and 0x80) != 0
       let payload_len_1 = (mask_and_payload_len and 0x7F).u64()
 
       pos = pos + 1
 
-      let payload_len_ext: U64 = match payload_len_1
+      let payload_len: U64 = match payload_len_1
       | 126 =>
+        let x = rb.peek_u16_be(pos)?.u64()
         pos = pos + 2
-        rb.peek_u16_be()?.u64()
+        x
       | 127 =>
+        let x = rb.peek_u64_be(pos)?
         pos = pos + 8
-        rb.peek_u64_be()?
+        x
       else
-        0
+        payload_len_1
       end
 
       let masking_key: U32 = if mask then
+        let x = rb.peek_u32_be(pos)?
         pos = pos + 4
-        rb.peek_u32_be()?
+        x
       else
         0
       end
 
-      let expected_size = pos + payload_len_1.usize() + payload_len_ext.usize()
+      let expected_size = pos + payload_len.usize()
+      let sz = rb.size()
 
-      @printf(("need size: " + expected_size.string() + ", actual size: " + rb.size().string() + "\n").cstring())
-
-      if expected_size < rb.size() then
+      // reading values (as opposed to peeking) is destructive, so we return from here
+      // if we don't have all the bytes we need.
+      if expected_size > sz then
         return
       end
+    else
+      // if we tried to peek and there weren't enough bytes in the reader then we end up here
+      return
     end
 
     try
@@ -187,19 +208,19 @@ primitive MessageDecoder
       // | fin | rsv1 | rsv2 | rsv3 | opcode(4) |
 
       let f_and_opcode = rb.u8()?
-      let fin = (f_and_opcode and 0x80) > 0
+      let fin = (f_and_opcode and 0x80) != 0
       let opcode = f_and_opcode and 0x0F
 
       // | mask | payload len (7) |
       let mask_and_payload_len = rb.u8()?
-      let mask = (mask_and_payload_len and 0x80) > 0
+      let mask = (mask_and_payload_len and 0x80) != 0
       let payload_len_1 = (mask_and_payload_len and 0x7F).u64()
 
-      let payload_len_ext: U64 = match payload_len_1
+      let payload_len: U64 = match payload_len_1
       | 126 => rb.u16_be()?.u64()
       | 127 => rb.u64_be()?
       else
-        0
+        payload_len_1
       end
 
       let masking_key: Array[U8] val = if mask then
@@ -212,14 +233,12 @@ primitive MessageDecoder
         [0; 0; 0; 0]
       end
 
-      let payload_size = payload_len_1.usize() + payload_len_ext.usize()
-
-      @printf(("payload size: " + payload_size.string() + ", remaining size: " + rb.size().string() + "\n").cstring())
-
-
-      let payload: Array[U8] val = rb.block(payload_len_1.usize() + payload_len_ext.usize())?
+      let payload: Array[U8] val = rb.block(payload_len.usize())?
 
       return Message(fin, opcode, mask, masking_key, payload)
+    else
+      // something bad has happened and you should feel bad about it.
+      @printf("OH SHIT DIDN'T HAVE AS MANY BTYES AS WE THOUGHT\n".cstring())
     end
 
     None
@@ -294,18 +313,9 @@ class ClientConnection is TCPConnectionNotify
     let vdata: Array[U8] val = consume data
     let ms = _msm(vdata)
 
-    for d in vdata.values() do
-      _out.write(Format.int[U8](d where width = 5, align = AlignRight, fmt = FormatHex))
-    end
-
-    _out.print("")
-
-    _out.print("in message: " + _msm.in_messages.string())
-
     for m in ms.values() do
-      _out.print("got message with payload size " + m.payload.size().string())
       if m.opcode == 1 then
-        _out.print("message text: " + String.from_array(m.payload))
+        // this is a text message, pass it on to websocket handler
         _ws_notify.received(conn, m)
       end
     end
@@ -324,8 +334,9 @@ class WebSocketNotify
     _ac_notify = ActionCableNotify(_out)
 
   fun ref received(conn: TCPConnection, msg: Message) =>
+    // pass all the text messages to the action cable hander
     if (msg.opcode == 0x01) then
-      _out.print("payload: " + String.from_array(msg.payload))
+      _out.print("payload: " + String.from_array(msg.payload_unmasked()))
       _ac_notify.received(conn, String.from_array(msg.payload))
     end
 
@@ -338,6 +349,7 @@ class ActionCableNotify
   fun ref received(conn: TCPConnection, data: String) =>
     if data.contains("\"type\":\"welcome\"") then
       _out.print("GOT WELCOME MESSAGE!!!")
+      
       // send subscribe message
 
       let message = Message(true, 1, true, [1; 1; 1; 1], """
@@ -350,29 +362,5 @@ class ActionCableNotify
 
       message.render(wb)
 
-      // BEGING DEBUG
-      let subscribe_bytes: Array[(String val | Array[U8 val] val)] val = wb.done()
-
-      let rb: Reader = Reader
-
-      for x in subscribe_bytes.values() do
-        rb.append(x)
-      end
-
-      let nm = MessageDecoder.parse(rb)
-
-      match nm
-      | let m: Message =>
-        _out.print("outgoing message looks ok")
-        _out.print("payload: " + String.from_array(m.payload))
-      | None => _out.print("outgoing message has issues")
-      end
-
-      // END DEBUG
-      
-      // conn.writev(subscribe_bytes)
-
-      for x in subscribe_bytes.values() do
-        conn.write(x)
-      end
+      conn.writev(wb.done())
     end
