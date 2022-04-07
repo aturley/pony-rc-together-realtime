@@ -3,8 +3,11 @@ use "collections"
 use "encode/base64"
 use "files"
 use "format"
+use "json"
 use "net"
 use "net_ssl"
+
+use "pjq"
 
 use @printf[I64](f: Pointer[U8] tag)
 
@@ -65,8 +68,6 @@ Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==
 Sec-WebSocket-Version: 13
 
 """.clone() end) .> replace("{{AUTHORIZATION}}", basic_auth) .> replace ("{{HOST}}", host) .> replace ("{{ORIGIN}}", origin) .> replace("\n", "\r\n")
-
-    env.out.print(req)
 
     try
       TCPConnection(tcp_connect_auth, SSLConnection(ClientConnection(env.out, req), sslctx.client(host)?), host, service)
@@ -336,31 +337,67 @@ class WebSocketNotify
   fun ref received(conn: TCPConnection, msg: Message) =>
     // pass all the text messages to the action cable hander
     if (msg.opcode == 0x01) then
-      _out.print("payload: " + String.from_array(msg.payload_unmasked()))
       _ac_notify.received(conn, String.from_array(msg.payload))
     end
 
 class ActionCableNotify
   let _out: OutStream
+  var _subscribed: Bool
 
   new create(out: OutStream) =>
     _out = out
+    _subscribed = false
 
   fun ref received(conn: TCPConnection, data: String) =>
-    if data.contains("\"type\":\"welcome\"") then
-      _out.print("GOT WELCOME MESSAGE!!!")
-      
-      // send subscribe message
+    try
+      let pjq = PJQ.from_string(data)?
 
-      let message = Message(true, 1, true, [1; 1; 1; 1], """
+      if pjq("type").eq("welcome") then
+    
+        _out.print("GOT WELCOME MESSAGE!!!")
+      
+        // send subscribe message
+
+        let message = Message(true, 1, true, [1; 1; 1; 1], """
 {
   "command": "subscribe",
   "identifier": "{\"channel\":\"ApiChannel\"}"
 }
 """.array())
-      let wb: Writer = Writer
+        let wb: Writer = Writer
 
-      message.render(wb)
+        message.render(wb)
 
-      conn.writev(wb.done())
+        conn.writev(wb.done())
+      elseif pjq("type").eq("confirm_subscription") then
+        _out.print("SUBSCRIPTION CONFIRMED!!!")
+        _subscribed == true
+      elseif pjq("message")("type").eq("world") then
+        _out.print("GOT WORLD MESSAGE!!!")
+        try
+          let entities = pjq("message")("payload")("entities").result(0)? as JsonArray
+        else
+          _out.print("ERROR EXTRACTING WORLD ENTITIES!!!" + data)
+        end
+      elseif pjq("message")("type").eq("entity") then
+        _out.print("GOT ENTITY MESSAGE!!!")
+        try
+          let payload = pjq("message")("payload")
+          if payload("type").eq("Avatar") then
+            let pos = payload("pos")
+            let x = pos("x").i64()?
+            let y = pos("y").i64()?
+
+            let person_name = payload("person_name").string()?
+            let flair = try payload("flair").string()? else "" end
+            
+            _out.print(person_name + " (" + flair + ") is at " + x.string() + ", " + y.string())
+          end
+        else
+          _out.print("HAD SOME TROUBLE WITH THE AVATAR: " + data)
+        end
+      end
     end
+      
+
+    

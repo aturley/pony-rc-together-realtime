@@ -10,7 +10,7 @@ Together, the virtual Recurse Center space.
 Currently it does the following:
 * connects to RC Together using a websocket connection
 * subscribes to the `ApiChannel` channel
-* dumps a lot of debugging information about incoming messages
+* dumps where users (or at least their avatars) are
 
 ## Build
 
